@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-import time
 import threading
+import time
 import random
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple
 
 import cv2
 
@@ -11,382 +11,303 @@ from plan_test import plan_path_for_goal
 from follow_path import follow_path_constant_speed
 
 
-# =========================
-# CONFIG
-# =========================
+# ============ 설정값 ============
 
-MAP_FILE = "map_smallroom_60x60.json"
+MAP_FILE = "map_smallroom_60x60.json"   # 쓰는 맵 파일 이름
+AUTO_INTERVAL = 5.0                     # 자동 모드에서 연속 이동 사이 대기 시간 (초)
+STATUS_PERIOD = 0.5                     # 서버로 상태 전송 주기 (초)
 
-# 자동 모드에서 다음 랜덤 목표를 생성하는 최소 간격(초)
-AUTO_INTERVAL_SEC = 6.0
-
-# 상태 전송 주기(초)
-STATUS_PERIOD_SEC = 0.5
-
-# 서버 폴링 주기(초) - 서버에서 모드/목표를 가져오기
-SERVER_POLL_SEC = 0.2
-
-# 카메라 캡처 프레임 주기(초)
-CAM_PERIOD_SEC = 0.03
-
-# follow_path 속도 파라미터 (이미 캘리브레이션 해둔 값 사용)
+# 이동/회전 속도 설정 (follow_path와 맞춰 줄 것)
 V_CRUISE = 0.35
 V_CHARGE = 0.8
 OMEGA_TURN = 0.5
 SCALE_V_MPS = 0.15
 SCALE_OMEGA_RAD = 0.85
 
-# 플래너 파라미터
-INFLATE_RADIUS = 2
-MIN_CHARGE_CELLS = 8
+
+# ============ 글로벌 상태 ============
+
+mode_lock = threading.Lock()
+current_mode = "auto"  # "auto" 또는 "manual"
+
+movement_lock = threading.Lock()
+movement_thread: Optional[threading.Thread] = None
+movement_busy = False
+
+stop_flag = False
+
+# 현재 위치/목표는 간단한 상태만 공유 (정확한 pose는 나중에)
+current_target_cell: Optional[Tuple[int, int]] = None
+last_auto_time = 0.0
 
 
-# =========================
-# Shared State (thread-safe)
-# =========================
+# ============ 서버 통신 (나중에 구현할 부분) ============
 
-stop_event = threading.Event()
-
-state_lock = threading.Lock()
-shared_state: Dict[str, Any] = {
-    "mode": "auto",                 # "auto" | "manual"
-    "goal_cell": None,              # (x,y) or None
-    "is_enemy_goal": False,         # bool
-    "pose_est_world": None,         # (x,y,theta) or None (TODO)
-    "last_cmd_ts": 0.0,             # 최근 목표 수신 시각
-    "last_plan_ok": False,          # 마지막 플랜 성공 여부
-    "last_error": "",               # 마지막 에러 문자열
-}
-
-
-# =========================
-# Server I/O (TODO stub)
-# =========================
-
-def server_poll_command() -> Optional[Dict[str, Any]]:
+def get_mode_and_manual_target_from_server() -> Tuple[str, Optional[Tuple[float, float]]]:
     """
-    서버에서 최신 명령을 가져온다 (폴링).
-    반환 예시(권장):
-      {
-        "mode": "manual" or "auto",
-        "goal": {"type": "cell", "x": 30, "y": 20}  # or type:"world"
-        "is_enemy_goal": true/false
-      }
+    서버로부터 현재 모드와 수동 모드일 때의 목표 좌표를 받아오는 함수.
+
+    return:
+        mode: "auto" 또는 "manual"
+        manual_target_world: (wx, wy) [미터 단위 월드 좌표] 또는 None
 
     TODO:
-      - requests.get(...) 또는 websocket으로 대체
-      - 실패 시 None 반환
+        - HTTP / WebSocket 등으로 서버와 통신하도록 구현
+        - 지금은 예시로 global current_mode만 사용, 좌표는 항상 None 반환
     """
-    # TODO: 실제 서버 통신 구현
-    return None
+    global current_mode
+
+    # TODO: 여기에서 실제 서버 통신 구현
+    # 예: mode, x, y = 요청 결과
+    # 일단은 current_mode만 보고 manual 좌표는 None 리턴
+    return current_mode, None
 
 
-def server_send_status(payload: Dict[str, Any]) -> None:
+def send_status_to_server(status: dict):
     """
-    서버로 상태를 전송한다.
-    payload 예시:
-      {
-        "mode": "auto",
-        "moving": true,
-        "target_cell": [x,y],
-        "pose_world": [x,y,theta],
-        "ts": 123.45
-      }
+    현재 상태(모드, 이동 상태, 목표 등)를 서버에 주기적으로 전송하는 함수.
+
+    status 예시:
+        {
+          "mode": "auto",
+          "moving": True,
+          "target_cell": [gx, gy],
+          "timestamp": ...
+        }
 
     TODO:
-      - requests.post(...) 또는 websocket send
+        - requests.post(...) 혹은 WebSocket 등으로 전송
+        - 지금은 print만 수행
     """
-    # TODO: 실제 서버 전송 구현
-    # 지금은 디버그 출력만
-    print("[STATUS]", payload)
+    print("[STATUS]", status)
 
 
-# =========================
-# Camera thread
-# =========================
+# ============ 카메라 스레드 ============
 
-def camera_thread_main():
+def camera_loop():
     """
-    카메라는 항상 켜두되,
-    OpenCV/GStreamer가 실패하더라도 메인이 죽지 않도록 재시도한다.
+    항상 카메라를 켜두고 프레임을 읽는 루프.
+    - 나중에 여기에서 적 인식, 스트리밍 등을 붙이면 됨.
     """
-    print("[CAM] thread start")
-    cap = None
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("[CAM] Failed to open camera")
+        return
 
-    while not stop_event.is_set():
-        if cap is None:
-            cap = cv2.VideoCapture(0)
-            if not cap.isOpened():
-                print("[CAM] open failed. retry in 1s")
-                cap.release()
-                cap = None
-                time.sleep(1.0)
-                continue
-            print("[CAM] opened")
-
+    print("[CAM] Camera loop started")
+    while not stop_flag:
         ret, frame = cap.read()
         if not ret:
-            # 카메라 스트림이 깨졌을 때 재오픈
-            print("[CAM] read failed. reopen in 0.5s")
-            cap.release()
-            cap = None
-            time.sleep(0.5)
+            time.sleep(0.05)
             continue
 
-        # TODO: 여기서 적 탐지/스트리밍/프레임 압축 등을 수행
-        # 예: enemy_found = detect_enemy(frame)
-        # if enemy_found: shared_state["is_enemy_goal"]=True 같은 인터럽트 로직 추가 가능
+        # TODO: 여기에서 프레임 처리 / 서버 전송 / 적 인식 등을 수행
+        # 지금은 아무것도 안 하고 버림
 
-        time.sleep(CAM_PERIOD_SEC)
+        # CPU 사용률 줄이려고 살짝 쉼
+        time.sleep(0.02)
 
-    if cap is not None:
-        cap.release()
-
-    print("[CAM] thread stop")
+    cap.release()
+    print("[CAM] Camera loop stopped")
 
 
-# =========================
-# Planning helpers
-# =========================
+# ============ 유틸 함수들 ============
 
-def clamp_goal_cell(m, cell: Tuple[int, int]) -> Optional[Tuple[int, int]]:
-    x, y = cell
-    if 0 <= x < m.width and 0 <= y < m.height:
-        return (x, y)
-    return None
-
-
-def pick_random_goal_cell(m, start_cell: Tuple[int, int]) -> Optional[Tuple[int, int]]:
+def pick_random_reachable_goal_cell(m, start_cell: Tuple[int, int], is_enemy_goal: bool = False) -> Optional[Tuple[int, int]]:
     """
-    자동모드 랜덤 목표 선택:
-    - 장애물/비가용은 plan_path_for_goal로 걸러낸다
+    맵 전체에서 랜덤 셀을 뽑아서, 거기로 경로가 존재하면 goal로 사용.
+    - 장애물 여부는 plan_path_for_goal 결과로 대신 판단 (경로 없으면 실패)
     """
-    for _ in range(60):
+    max_try = 50
+    for _ in range(max_try):
         gx = random.randint(0, m.width - 1)
         gy = random.randint(0, m.height - 1)
         goal = (gx, gy)
         if goal == start_cell:
             continue
 
-        path, _ = plan_path_for_goal(
+        path_cells, _ = plan_path_for_goal(
             m,
             start_cell=start_cell,
             goal_cell=goal,
-            is_enemy_goal=False,
-            inflate_radius=INFLATE_RADIUS,
-            min_charge_cells=MIN_CHARGE_CELLS,
+            is_enemy_goal=is_enemy_goal,
+            inflate_radius=2,
+            min_charge_cells=8,
         )
-        if path is not None:
+        if path_cells is not None:
             return goal
+
     return None
 
 
-def goal_from_command(m, cmd: Dict[str, Any]) -> Tuple[Optional[Tuple[int, int]], bool, str]:
+def world_to_cell_safe(m, wx: float, wy: float) -> Optional[Tuple[int, int]]:
+    """월드 좌표 -> 셀 좌표 변환 (맵 범위 체크 포함)."""
+    cx, cy = world_to_cell(wx, wy, m.resolution)
+    if 0 <= cx < m.width and 0 <= cy < m.height:
+        return (cx, cy)
+    return None
+
+
+# ============ 이동 스레드 ============
+
+def movement_worker(
+    m,
+    start_cell: Tuple[int, int],
+    goal_cell: Tuple[int, int],
+    is_enemy_goal: bool,
+):
     """
-    서버 명령 dict를 받아 goal_cell, is_enemy_goal을 결정한다.
-    아직 서버 프로토콜이 미정이므로 최대한 유연하게 처리.
+    실제로 경로를 만들고 follow_path_constant_speed를 호출하는 작업.
+    별도 스레드에서 동작.
     """
-    try:
-        mode = cmd.get("mode", None)
-        if mode not in ("auto", "manual"):
-            mode = None
+    global movement_busy, current_target_cell
 
-        is_enemy = bool(cmd.get("is_enemy_goal", False))
-        goal = cmd.get("goal", None)
-        if goal is None:
-            return None, is_enemy, "no goal in command"
+    with movement_lock:
+        movement_busy = True
+        current_target_cell = goal_cell
 
-        gtype = goal.get("type", "cell")
+    print(f"[MOVE] New task: start={start_cell}, goal={goal_cell}, enemy={is_enemy_goal}")
 
-        if gtype == "cell":
-            gx = int(goal["x"])
-            gy = int(goal["y"])
-            c = clamp_goal_cell(m, (gx, gy))
-            if c is None:
-                return None, is_enemy, "goal cell out of range"
-            return c, is_enemy, ""
+    # 1) 셀 기반 경로 계획
+    path_cells, used_enemy_mode = plan_path_for_goal(
+        m,
+        start_cell=start_cell,
+        goal_cell=goal_cell,
+        is_enemy_goal=is_enemy_goal,
+        inflate_radius=2,
+        min_charge_cells=8,
+    )
 
-        if gtype == "world":
-            wx = float(goal["x"])
-            wy = float(goal["y"])
-            cx, cy = world_to_cell(wx, wy, m.resolution)
-            c = clamp_goal_cell(m, (cx, cy))
-            if c is None:
-                return None, is_enemy, "goal world->cell out of range"
-            return c, is_enemy, ""
+    if path_cells is None:
+        print("[MOVE] No path found, abort this task.")
+        with movement_lock:
+            movement_busy = False
+        return
 
-        return None, is_enemy, f"unknown goal type: {gtype}"
+    print("[MOVE] Path cells:", path_cells)
+    print("[MOVE] Used enemy mode:", used_enemy_mode)
 
-    except Exception as e:
-        return None, False, f"parse command error: {e}"
+    # 2) 셀 -> 월드 좌표 변환
+    waypoints_world = []
+    for (cx, cy) in path_cells:
+        wx, wy = cell_to_world(cx, cy, m.resolution)
+        waypoints_world.append((wx, wy))
 
+    print("[MOVE] Waypoints(world):", waypoints_world)
 
-# =========================
-# Movement worker
-# =========================
+    # 3) 경로 따라가기 (open-loop)
+    follow_path_constant_speed(
+        waypoints_world,
+        is_enemy_goal=is_enemy_goal,
+        v_cruise_norm=V_CRUISE,
+        v_charge_norm=V_CHARGE,
+        omega_turn_norm=OMEGA_TURN,
+        scale_v_mps=SCALE_V_MPS,
+        scale_omega_rad=SCALE_OMEGA_RAD,
+    )
 
-def move_worker(m, start_cell: Tuple[int, int], goal_cell: Tuple[int, int], is_enemy_goal: bool):
-    """
-    플랜 -> 웨이포인트 변환 -> follow_path 실행
-    """
-    try:
-        with state_lock:
-            shared_state["last_error"] = ""
-            shared_state["last_plan_ok"] = False
+    print("[MOVE] Task finished.")
 
-        path_cells, used_enemy_mode = plan_path_for_goal(
-            m,
-            start_cell=start_cell,
-            goal_cell=goal_cell,
-            is_enemy_goal=is_enemy_goal,
-            inflate_radius=INFLATE_RADIUS,
-            min_charge_cells=MIN_CHARGE_CELLS,
-        )
-
-        if path_cells is None:
-            with state_lock:
-                shared_state["last_plan_ok"] = False
-                shared_state["last_error"] = "No path found"
-            print("[MOVE] No path found")
-            return
-
-        waypoints_world = [cell_to_world(x, y, m.resolution) for (x, y) in path_cells]
-        with state_lock:
-            shared_state["last_plan_ok"] = True
-
-        print(f"[MOVE] start={start_cell} goal={goal_cell} enemy={is_enemy_goal} used_enemy_mode={used_enemy_mode}")
-        print(f"[MOVE] waypoints={waypoints_world}")
-
-        follow_path_constant_speed(
-            waypoints_world=waypoints_world,
-            is_enemy_goal=is_enemy_goal,
-            v_cruise_norm=V_CRUISE,
-            v_charge_norm=V_CHARGE,
-            omega_turn_norm=OMEGA_TURN,
-            scale_v_mps=SCALE_V_MPS,
-            scale_omega_rad=SCALE_OMEGA_RAD,
-        )
-
-    except Exception as e:
-        with state_lock:
-            shared_state["last_plan_ok"] = False
-            shared_state["last_error"] = f"move_worker exception: {e}"
-        print("[MOVE] Exception:", e)
+    with movement_lock:
+        movement_busy = False
 
 
-# =========================
-# MAIN LOOP
-# =========================
+# ============ 메인 루프 ============
 
 def main():
+    global stop_flag, last_auto_time
+
     print("[MAIN] Loading map ...")
     m = load_map(MAP_FILE)
 
     if m.start is None:
         raise RuntimeError("Start(S) not found in map")
+    current_cell = m.start  # 현재 위치를 맵 상의 셀로 추정 (초기에는 S 위치)
 
-    # "현재 위치"는 지금은 open-loop라서 완벽하진 않음.
-    # 여기서는 “마지막으로 목표로 삼았던 셀”을 현재 셀로 간주하는 단순 모델로 시작.
-    # TODO: 나중에 pose_est를 붙이면 start_cell을 추정 pose 기반으로 바꾸기.
-    current_cell = m.start
+    # 카메라 스레드 시작
+    cam_thread = threading.Thread(target=camera_loop, daemon=True)
+    cam_thread.start()
 
-    # 카메라 스레드 시작 (실패해도 main 유지)
-    cam_th = threading.Thread(target=camera_thread_main, daemon=True)
-    cam_th.start()
-
-    move_th: Optional[threading.Thread] = None
-    last_auto = time.time()
-    last_poll = 0.0
-    last_status = 0.0
-
-    print("[MAIN] Enter loop (Ctrl+C to stop)")
+    print("[MAIN] Enter main loop (Ctrl+C to stop)")
+    last_status_time = 0.0
+    last_auto_time = time.time()
 
     try:
         while True:
             now = time.time()
 
-            # (A) 서버 폴링
-            if now - last_poll >= SERVER_POLL_SEC:
-                cmd = server_poll_command()
-                last_poll = now
+            # 1) 서버에서 모드/수동 목표 좌표 가져오기
+            mode, manual_target_world = get_mode_and_manual_target_from_server()
+            with mode_lock:
+                # 서버 응답으로 모드 갱신
+                global current_mode
+                current_mode = mode
 
-                if cmd is not None:
-                    goal_cell, is_enemy, err = goal_from_command(m, cmd)
+            # 2) 이동 상태 확인
+            with movement_lock:
+                busy = movement_busy
+                goal_cell = current_target_cell
 
-                    with state_lock:
-                        if "mode" in cmd and cmd["mode"] in ("auto", "manual"):
-                            shared_state["mode"] = cmd["mode"]
-                        shared_state["is_enemy_goal"] = is_enemy
-                        shared_state["last_cmd_ts"] = now
-                        if err:
-                            shared_state["last_error"] = err
+            # 3) 수동 모드: 수동 목표가 있고, 현재 이동 중이 아니라면 즉시 이동 시작
+            if mode == "manual" and not busy and manual_target_world is not None:
+                c = world_to_cell_safe(m, manual_target_world[0], manual_target_world[1])
+                if c is not None:
+                    goal_cell = c
+                    t = threading.Thread(
+                        target=movement_worker,
+                        args=(m, current_cell, goal_cell, False),  # 수동 모드는 기본적으로 enemy=False로 가정
+                        daemon=True,
+                    )
+                    t.start()
+                    with movement_lock:
+                        movement_thread = t
+                        movement_busy = True
+                        current_target_cell = goal_cell
 
-                    if goal_cell is not None:
-                        with state_lock:
-                            shared_state["goal_cell"] = goal_cell
+                    current_cell = goal_cell
+                    last_auto_time = now
+                else:
+                    print("[MAIN] Manual target out of map range, ignore.")
 
-            # (B) 이동 중 여부 판단 (전역 movement_busy 같은 거 안 씀!)
-            moving = (move_th is not None) and move_th.is_alive()
-
-            # (C) 모드에 따라 목표 결정
-            with state_lock:
-                mode = shared_state["mode"]
-                goal_cell = shared_state["goal_cell"]
-                is_enemy_goal = shared_state["is_enemy_goal"]
-
-            # 자동 모드: 일정 주기마다 랜덤 목표를 세팅(이동 중이면 세팅만 미룸)
-            if mode == "auto" and (not moving) and (now - last_auto >= AUTO_INTERVAL_SEC):
-                goal = pick_random_goal_cell(m, current_cell)
+            # 4) 자동 모드: 일정 시간마다 랜덤 목표로 이동 (idle일 때만)
+            if mode == "auto" and not busy and (now - last_auto_time) > AUTO_INTERVAL:
+                goal = pick_random_reachable_goal_cell(m, current_cell, is_enemy_goal=False)
                 if goal is not None:
-                    with state_lock:
-                        shared_state["goal_cell"] = goal
-                        shared_state["is_enemy_goal"] = False
-                    goal_cell = goal
-                    is_enemy_goal = False
-                    last_auto = now
+                    t = threading.Thread(
+                        target=movement_worker,
+                        args=(m, current_cell, goal, False),
+                        daemon=True,
+                    )
+                    t.start()
+                    with movement_lock:
+                        movement_thread = t
+                        movement_busy = True
+                        current_target_cell = goal
 
-            # (D) 이동 시작 조건:
-            # - 이동 중이 아니고
-            # - 목표가 존재하면
-            if (not moving) and (goal_cell is not None):
-                move_th = threading.Thread(
-                    target=move_worker,
-                    args=(m, current_cell, goal_cell, is_enemy_goal),
-                    daemon=True,
-                )
-                move_th.start()
+                    current_cell = goal
+                    last_auto_time = now
+                else:
+                    print("[MAIN] Failed to pick reachable random goal.")
 
-                # open-loop 단순 모델: 목표를 곧 “현재 셀”로 갱신
-                current_cell = goal_cell
+            # 5) 서버로 상태 전송
+            if (now - last_status_time) > STATUS_PERIOD:
+                status = {
+                    "mode": mode,
+                    "moving": busy,
+                    "target_cell": list(goal_cell) if goal_cell is not None else None,
+                    "timestamp": now,
+                }
+                send_status_to_server(status)
+                last_status_time = now
 
-                # 목표는 한 번 소비하면 지움 (같은 명령 반복 실행 방지)
-                with state_lock:
-                    shared_state["goal_cell"] = None
-
-            # (E) 상태 전송
-            if now - last_status >= STATUS_PERIOD_SEC:
-                with state_lock:
-                    payload = {
-                        "ts": now,
-                        "mode": shared_state["mode"],
-                        "moving": moving,
-                        "last_plan_ok": shared_state["last_plan_ok"],
-                        "last_error": shared_state["last_error"],
-                        "current_cell": list(current_cell),
-                        # TODO: pose 추정 붙이면 pose_world도 포함
-                        # "pose_world": [x, y, theta],
-                    }
-                server_send_status(payload)
-                last_status = now
-
-            time.sleep(0.01)
+            time.sleep(0.1)
 
     except KeyboardInterrupt:
-        print("[MAIN] KeyboardInterrupt -> stopping")
+        print("[MAIN] KeyboardInterrupt, stopping...")
     finally:
-        stop_event.set()
-        time.sleep(0.2)
-        print("[MAIN] Exit")
+        stop_flag = True
+        time.sleep(0.5)  # 카메라 스레드 정리 시간
+        print("[MAIN] Exit.")
 
 
 if __name__ == "__main__":
