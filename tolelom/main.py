@@ -20,9 +20,12 @@ def init_websocket_client(server_url: str = "ws://tolelom.xyz:3000/websocket/agv
 
 
 # ====== 실제 시스템에서는 여기만 하드웨어/알고리즘 값으로 교체 ======
+cnt = 0.0
 def get_position() -> Tuple[float, float, float]:
     # TODO: localization/odometry에서 읽기
-    return (1.0, 1.0, 0.0)
+    global cnt
+    cnt += 0.1
+    return cnt, cnt, 0.0
 
 def get_status() -> Dict[str, Any]:
     # TODO: 내부 상태머신/센서에서 읽기
