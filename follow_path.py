@@ -1,12 +1,12 @@
 import math
 import time
-from typing import List, Tuple
-
-from map_loader import load_map, cell_to_world
-from plan_test import plan_path_for_goal  # 경로 생성은 기존 함수 재사용
+from time import sleep
+from typing import List, Tuple, Optional, Callable
+from SCSCtrl import TTLServo
 
 try:
-    from jetbot import Robot   # JETANK 기본 제어 클래스
+    from jetbot import Robot  # JETANK 기본 제어
+    
 except ImportError:
     Robot = None  # PC 테스트용
 
@@ -16,82 +16,113 @@ except ImportError:
 # ==========================
 
 class JetankRobot:
-    """JETANK를 (v, omega) 명령으로 제어하기 위한 래퍼.
-
-    - v_norm   : -1.0 ~ 1.0  (정규화된 전후진 속도)
-    - omega_norm: -1.0 ~ 1.0 (정규화된 회전 속도, +는 반시계 방향)
-
-    내부적으로는 jetbot.Robot.set_motors(left, right)를 사용한다.
+    """
+    v_norm   : -1.0 ~ 1.0
+    omega_norm: -1.0 ~ 1.0  ( + : CCW )
+    내부: set_motors(left, right) "포지셔널"로만 호출 (키워드 금지)
     """
 
     def __init__(self):
         if Robot is None:
-            print("[WARN] jetbot.Robot 모듈을 찾을 수 없습니다. 모터 제어는 비활성화됩니다.")
+            print("[WARN] jetbot.Robot not found. Motor control disabled (dry-run).")
             self.robot = None
         else:
             self.robot = Robot()
+            # 모터의 초기 회전 임계값입니다.
+            # 기어 모터는 낮은 PWM 간격에서 회전할 수 없습니다.
+            # 장기간의 정전은 모터의 수명을 줄일 수 있습니다.
+            moveStartTor = 0.15    
+
+            fb_input = 0           # 전방 및 후방 방향의 속도 매개변수를 저장합니다.
+            lr_input = 0           # 조향에 대한 매개변수를 저장합니다.
+
+            servoCtrlTime = 0.001   # TTL 서보 통신 후 오류를 피하기 위한 지연입니다.
+            speedInput = 1000       # 카메라의 틸트 및 팬 회전 속도입니다.
+
+            armXStatus = 0         # 로봇 팔의 X 축 이동 상태 (원거리 및 근거리 방향)입니다.
+            armYStatus = 0         # 로봇 팔의 Y 축 이동 상태 (수직 방향)입니다.
+            cameStatus = 0         # 카메라의 이동 상태입니다.
+            goalX = 130            # 로봇 팔의 그리퍼의 X축 좌표를 저장하세요.
+            goalY = 50             # 로봇 팔의 그리퍼의 Y축 좌표를 저장하세요.
+            goalC = 0              # 카메라의 위치를 저장하세요.
+
+            xMax = 210             # 로봇 팔의 X 축 최대값을 설정하세요.
+            xMin = 140             # 로봇 팔의 X 축 최소값을 설정하세요.
+
+            yMax = 120             # 로봇 팔의 Y 축 최대값을 설정하세요.
+            yMix = -120            # 로봇 팔의 Y 축 최소값을 설정하세요.
+
+            cMax = 25              # 카메라의 최대 위치를 설정하세요.
+            cMin = -45             # 카메라의 최소 위치를 설정하세요.
+            cDan = 0               # 카메라의 위험한 선을 설정하세요.
+
+            movingTime = 0.005 # 로봇 팔 역운동학 함수의 인접한 두 위치 간의 실행 시간을 설정하세요.
+            movingSpeed = 1        # 로봇 팔의 이동 속도를 설정하세요.
+            grabStatus = 0         # 그리퍼의 이동 상태입니다.
+            cameraPosCheckMode = 1 # 카메라 위치 확인 기능의 스위치, 1 - 켜기, 0 - 끄기입니다.
+                                   # 한 번 켜면, 로봇 팔과 카메라 간의 간섭을 피할 수 있습니다.
+            cameraPosDanger = 0    # 카메라가 위험 지역에 있는지 여부입니다.
+            cameraMoveSafe = 0     # 카메라가 안전 지역으로 이동했는지 여부입니다.
+            
+            TTLServo.servoAngleCtrl(1, 0, 1, 180)
+            TTLServo.servoAngleCtrl(2, -80, 1, 180)
+            TTLServo.servoAngleCtrl(3, -60, 1, 180)
+            TTLServo.servoAngleCtrl(4, -35, 1, 180)
+            print('ready!')
+            
+
+    def _set_motors_safe(self, left: float, right: float):
+        left = float(max(-1.0, min(1.0, left)))
+        right = float(max(-1.0, min(1.0, right)))
+
+        if self.robot is None:
+            print(f"[MOTOR] (dry-run) left={left:.2f}, right={right:.2f}")
+            return
+
+        # ✅ 포지셔널만 사용 (키워드 사용 금지!)
+        self.robot.set_motors(left, right)
 
     def set_velocity(self, v_norm: float, omega_norm: float):
-        """정규화된 선속도/각속도를 좌우 바퀴 속도로 변환해서 모터에 전달."""
-        # 클램프
         v_norm = max(-1.0, min(1.0, v_norm))
         omega_norm = max(-1.0, min(1.0, omega_norm))
 
-        # 간단한 차동구동 모델
-        k_omega = 0.7  # 회전 기여 비율 (기본 샘플에서 잘 동작하던 값)
-
+        # 차동구동 (너가 기존에 쓰던 감으로 k_omega 유지)
+        k_omega = 0.7
         left = v_norm - k_omega * omega_norm
         right = v_norm + k_omega * omega_norm
 
-        # 다시 클램프
-        left = max(-1.0, min(1.0, left))
-        right = max(-1.0, min(1.0, right))
-
-        if self.robot is not None:
-            self.robot.set_motors(left, right)
-        else:
-            print(f"[MOTOR] (dry-run) left={left:.2f}, right={right:.2f}")
+        self._set_motors_safe(left, right)
 
     def stop(self):
-        if self.robot is not None:
-            self.robot.set_motors(0.0, 0.0)
-        else:
-            print("[MOTOR] (dry-run) stop")
+        self._set_motors_safe(0.0, 0.0)
 
 
 # ==========================
-# 단순 Pose 추정 (옵션)
+# Pose Estimator (open-loop)
 # ==========================
 
 class PoseEstimator:
-    """(선속도, 각속도, 시간)을 적분해서 (x, y, theta)를 추정.
-
-    - x, y   : 미터 단위, 맵 기준 좌표
-    - theta  : 라디안, [-pi, pi]
-    """
-
     def __init__(self, x0: float, y0: float, theta0: float = 0.0):
         self.x = x0
         self.y = y0
-        self.theta = theta0
+        self.theta = theta0  # rad
 
     def update(self, v_mps: float, omega_rad: float, dt: float):
-        # dt 동안의 평균 속도/각속도로 적분
         self.x += v_mps * math.cos(self.theta) * dt
         self.y += v_mps * math.sin(self.theta) * dt
         self.theta += omega_rad * dt
         self.theta = (self.theta + math.pi) % (2 * math.pi) - math.pi
-
-    def set_heading(self, theta: float):
-        self.theta = (theta + math.pi) % (2 * math.pi) - math.pi
 
     def get_pose(self) -> Tuple[float, float, float]:
         return self.x, self.y, self.theta
 
 
 # ==========================
-# 경로 따라가기 (open-loop, 상수 속도)
+# 경로 따라가기 (상수 속도, 실시간 pose 갱신)
 # ==========================
+
+
+    
 
 def follow_path_constant_speed(
     waypoints_world: List[Tuple[float, float]],
@@ -101,31 +132,74 @@ def follow_path_constant_speed(
     omega_turn_norm: float = 0.5,
     scale_v_mps: float = 0.15,
     scale_omega_rad: float = 0.85,
-):
-    """정해진 경로(웨이포인트)를 따라가는 단순 open-loop 제어.
-
-    - 모든 직선 구간:
-        * 적이 아닌 일반 구간: v = v_cruise_norm, omega = 0
-        * 적 돌진 마지막 직선: v = v_charge_norm, omega = 0
-    - 모든 회전:
-        * v = 0, |omega| = omega_turn_norm (항상 동일한 회전 속도)
-    - 각 segment마다 "얼마나 오래" 동작할지만 거리/각도에 따라 계산.
+    pose_update_cb: Optional[Callable[[float, float, float], None]] = None,
+    step_sec: float = 0.02,   # ✅ 20ms 단위로 계속 갱신
+) -> Tuple[float, float, float]:
     """
-
+    - TURN / DRIVE 구간을 step_sec 단위로 쪼개서:
+      * 모터 명령 유지
+      * pose_est.update(...) 지속 호출
+      * pose_update_cb(...) 지속 호출
+    """
     if len(waypoints_world) < 2:
-        print("[FOLLOW] Waypoints too short, nothing to do.")
-        return
+        print("[FOLLOW] Waypoints too short.")
+        x0, y0 = waypoints_world[0] if waypoints_world else (0.0, 0.0)
+        return (x0, y0, 0.0)
 
     robot = JetankRobot()
 
-    # Pose 추정은 선택적이지만, 서버 전송이나 디버깅용으로 유지
+    # 초기 pose를 첫 웨이포인트 중심으로 설정
     x0, y0 = waypoints_world[0]
     pose_est = PoseEstimator(x0, y0, theta0=0.0)
-
-    # 현재 추정 heading (초기에는 +x 방향 가정)
     theta_est = 0.0
 
+    if pose_update_cb:
+        pose_update_cb(*pose_est.get_pose())
+
     num_segments = len(waypoints_world) - 1
+
+    def run_for_duration(v_norm: float, omega_norm: float, v_mps: float, omega_rad: float, duration: float):
+        """
+        duration 동안 step_sec 간격으로:
+        - 모터 명령 유지
+        - pose 적분
+        - 콜백 호출
+        """
+        t_end = time.monotonic() + duration
+        last_t = time.monotonic()
+
+        # 모터 명령 시작
+        robot.set_velocity(v_norm, omega_norm)
+
+        while True:
+            now = time.monotonic()
+            if now >= t_end:
+                break
+
+            dt = now - last_t
+            last_t = now
+            if dt <= 0:
+                time.sleep(step_sec)
+                continue
+
+            pose_est.update(v_mps, omega_rad, dt)
+            if pose_update_cb:
+                pose_update_cb(*pose_est.get_pose())
+
+            # 일정 주기 유지
+            sleep_t = max(0.0, step_sec - (time.monotonic() - now))
+            if sleep_t > 0:
+                time.sleep(sleep_t)
+
+        # 마지막 잔여시간 보정(끝 경계까지)
+        now2 = time.monotonic()
+        if now2 < t_end:
+            dt = t_end - now2
+            pose_est.update(v_mps, omega_rad, dt)
+            if pose_update_cb:
+                pose_update_cb(*pose_est.get_pose())
+
+        robot.stop()
 
     try:
         for i in range(num_segments):
@@ -140,122 +214,155 @@ def follow_path_constant_speed(
 
             target_heading = math.atan2(dy, dx)
 
-            # 1) 먼저, 현재 heading에서 target_heading까지 회전 (제자리 회전)
-            # ------------------------------------------------------------
-            # 회전 각도
-            angle_diff = target_heading - theta_est
-            angle_diff = (angle_diff + math.pi) % (2 * math.pi) - math.pi
-            if abs(angle_diff) > 1e-3:
-                # 회전 방향
+            # ----------------------------
+            # 1) TURN
+            # ----------------------------
+            angle_diff = (target_heading - theta_est + math.pi) % (2 * math.pi) - math.pi
+            if abs(angle_diff) > math.radians(1.0):
                 turn_dir = 1.0 if angle_diff > 0 else -1.0
-                # 필요한 시간 = 각도 / (실제 각속도)
-                omega_real = omega_turn_norm * scale_omega_rad   # rad/s
+
+                omega_real = omega_turn_norm * scale_omega_rad      # rad/s
                 turn_time = abs(angle_diff) / max(omega_real, 1e-6)
 
                 print(f"[FOLLOW] Segment {i}: TURN angle={math.degrees(angle_diff):.1f}deg, time={turn_time:.2f}s")
 
-                robot.set_velocity(0.0, turn_dir * omega_turn_norm)
-                time.sleep(turn_time)
-                robot.stop()
+                # v=0, omega=const, 실시간 적분
+                run_for_duration(
+                    v_norm=0.0,
+                    omega_norm=turn_dir * omega_turn_norm,
+                    v_mps=0.0,
+                    omega_rad=turn_dir * omega_real,
+                    duration=turn_time,
+                )
 
-                # pose/heading 업데이트 (이론값 기준)
-                pose_est.update(0.0, turn_dir * omega_real, turn_time)
-                theta_est = target_heading
+                theta_est = target_heading  # 목표 heading으로 정렬된 것으로 간주
             else:
-                print(f"[FOLLOW] Segment {i}: TURN skipped (small angle).")
+                print(f"[FOLLOW] Segment {i}: TURN skipped")
 
-            # 2) 다음, 직선 이동
-            # ------------------------------------------------------------
-            # 어떤 속도로 갈지 결정 (적 돌진이면 마지막 segment에 대해 v_charge 사용)
+            # ----------------------------
+            # 2) DRIVE
+            # ----------------------------
             if is_enemy_goal and i == num_segments - 1:
                 v_cmd = v_charge_norm
             else:
                 v_cmd = v_cruise_norm
 
-            v_real = v_cmd * scale_v_mps  # m/s
+            v_real = v_cmd * scale_v_mps
             drive_time = seg_len / max(v_real, 1e-6)
 
             print(f"[FOLLOW] Segment {i}: DRIVE len={seg_len:.3f}m, v={v_cmd:.2f}, time={drive_time:.2f}s")
 
-            robot.set_velocity(v_cmd, 0.0)
-            time.sleep(drive_time)
-            robot.stop()
+            # omega=0, 직진 실시간 적분
+            run_for_duration(
+                v_norm=v_cmd,
+                omega_norm=0.0,
+                v_mps=v_real,
+                omega_rad=0.0,
+                duration=drive_time,
+            )
 
-            pose_est.update(v_real, 0.0, drive_time)
+            time.sleep(0.05)
+            
+            if is_enemy_goal and i == num_segments - 1:
+                TTLServo.servoAngleCtrl(2, 0, 1, 100)
+                TTLServo.servoAngleCtrl(3, 90, 1, 180)
+                turn_dir = 1.0
+                omega_real = omega_turn_norm * scale_omega_rad      # rad/s
+                turn_time = abs(math.radian(160.0)) / max(omega_real, 1e-6)
+                run_for_duration(
+                    v_norm=0.0,
+                    omega_norm=turn_dir * omega_turn_norm,
+                    v_mps=0.0,
+                    omega_rad=turn_dir * omega_real,
+                    duration=turn_time,
+                )
+                TTLServo.servoAngleCtrl(2, -100, 1, 1000)
+                TTLServo.servoAngleCtrl(3, 120, 1, 1000)
+                sleep(2)
+                TTLServo.servoAngleCtrl(1, 0, 1, 180)
+                TTLServo.servoAngleCtrl(2, -80, 1, 180)
+                TTLServo.servoAngleCtrl(3, -60, 1, 180)
+                TTLServo.servoAngleCtrl(4, -35, 1, 180)
+                sleep(2)
+                print('ready!')
 
-            # 잠깐 쉬어주기 (기계적 진동/슬립 정리)
-            time.sleep(0.1)
-
-    except KeyboardInterrupt:
-        print("[FOLLOW] Interrupted by user.")
     finally:
         robot.stop()
 
-    x, y, theta = pose_est.get_pose()
-    print(f"[FOLLOW] Finished. est pose = ({x:.2f}, {y:.2f}, {math.degrees(theta):.1f}deg)")
-
-
-# ==========================
-# 메인: 맵 로딩 + 경로 계획 + 경로 따라가기
-# ==========================
+    x, y, th = pose_est.get_pose()
+    print(f"[FOLLOW] Finished. est pose=({x:.2f},{y:.2f},theta_deg={math.degrees(th):.1f})")
+    return (x, y, th)
 
 def main():
-    # 1) 맵 로딩
-    print("[MAIN] Loading map ...")
-    # TODO: 여기서 사용하는 맵 이름만 네 상황에 맞게 바꿔줘
-    m_orig = load_map("map_smallroom_60x60.json")
+    def run_for_duration2(v_norm: float, omega_norm: float, v_mps: float, omega_rad: float, duration: float):
+        """
+        duration 동안 step_sec 간격으로:
+        - 모터 명령 유지
+        - pose 적분
+        - 콜백 호출
+        """
+        step_sec: float = 0.02
+        t_end = time.monotonic() + duration
+        last_t = time.monotonic()
 
-    if m_orig.start is None:
-        raise RuntimeError("Start(S) not found in map")
-    start_cell = m_orig.start
+        # 모터 명령 시작
+        robot.set_velocity(v_norm, omega_norm)
 
-    if not m_orig.enemies:
-        raise RuntimeError("Enemy(E) not found in map")
-    goal_cell = m_orig.enemies[0]
+        while True:
+            now = time.monotonic()
+            if now >= t_end:
+                break
 
-    # 서버에서 적 여부 플래그를 받을 예정이라면 이 값만 바꾸면 됨
-    is_enemy_goal = True  # 테스트용
+            dt = now - last_t
+            last_t = now
+            if dt <= 0:
+                time.sleep(step_sec)
+                continue
 
-    print(f"[MAIN] Start cell: {start_cell}, Goal cell: {goal_cell}, is_enemy_goal={is_enemy_goal}")
+            #pose_est.update(v_mps, omega_rad, dt)
+            #if pose_update_cb:
+                #pose_update_cb(*pose_est.get_pose())
 
-    # 2) 셀 기반 경로 계획
-    path_cells, used_enemy_mode = plan_path_for_goal(
-        m_orig,
-        start_cell=start_cell,
-        goal_cell=goal_cell,
-        is_enemy_goal=is_enemy_goal,
-        inflate_radius=2,
-        min_charge_cells=8,
+            # 일정 주기 유지
+            sleep_t = max(0.0, step_sec - (time.monotonic() - now))
+            if sleep_t > 0:
+                time.sleep(sleep_t)
+
+        # 마지막 잔여시간 보정(끝 경계까지)
+        now2 = time.monotonic()
+        if now2 < t_end:
+            dt = t_end - now2
+            #pose_est.update(v_mps, omega_rad, dt)
+            #if pose_update_cb:
+                #pose_update_cb(*pose_est.get_pose())
+
+        robot.stop()
+    
+    robot = JetankRobot()
+    omega_turn_norm : float = 0.5
+    scale_omega_rad : float = 0.85
+        
+    TTLServo.servoAngleCtrl(2, 0, 1, 100)
+    TTLServo.servoAngleCtrl(3, 90, 1, 180)
+    turn_dir = 1.0
+    omega_real = omega_turn_norm * scale_omega_rad      # rad/s
+    turn_time = abs(math.radians(180.0)) / max(omega_real, 1e-6)
+    run_for_duration2(
+        v_norm=0.0,
+        omega_norm=turn_dir * omega_turn_norm,
+        v_mps=0.0,
+        omega_rad=turn_dir * omega_real,
+        duration=turn_time,
     )
-
-    if path_cells is None:
-        print("[MAIN] No path found, abort.")
-        return
-
-    print("[MAIN] Planned cells:", path_cells)
-    print("[MAIN] Used enemy mode:", used_enemy_mode)
-
-    # 3) 셀 -> 월드 좌표(미터)로 변환
-    waypoints_world: List[Tuple[float, float]] = []
-    for (cx, cy) in path_cells:
-        wx, wy = cell_to_world(cx, cy, m_orig.resolution)
-        waypoints_world.append((wx, wy))
-
-    print("[MAIN] Waypoints (world):")
-    for i, w in enumerate(waypoints_world):
-        print(f"  [{i}] {w}")
-
-    # 4) 상수 속도 경로 따라가기
-    follow_path_constant_speed(
-        waypoints_world,
-        is_enemy_goal=is_enemy_goal,
-        v_cruise_norm=0.35,   # 일반 구간 직진 속도 (상수)
-        v_charge_norm=0.8,    # 적 돌진 마지막 직선 속도 (상수, 최고속)
-        omega_turn_norm=0.5,  # 회전 속도 (상수, 제자리 회전)
-        scale_v_mps=0.15,     # 캘리브레이션한 실제 m/s 스케일
-        scale_omega_rad=0.85, # 캘리브레이션한 실제 rad/s 스케일
-    )
-
-
+    #TTLServo.servoAngleCtrl(2, -100, 1, 1000)
+    #TTLServo.servoAngleCtrl(3, 120, 1, 1000)
+    sleep(1)
+    TTLServo.servoAngleCtrl(1, 0, 1, 180)
+    TTLServo.servoAngleCtrl(2, -80, 1, 180)
+    TTLServo.servoAngleCtrl(3, -60, 1, 180)
+    TTLServo.servoAngleCtrl(4, -40, 1, 180)
+    sleep(2)
+    print('ready!')
+    
 if __name__ == "__main__":
     main()
