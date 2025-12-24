@@ -12,7 +12,6 @@ from follow_path import follow_path_constant_speed
 
 
 # ============ 설정값 ============
-
 MAP_FILE = "map_smallroom_60x60.json"   # 쓰는 맵 파일 이름
 AUTO_INTERVAL = 5.0                     # 자동 모드에서 연속 이동 사이 대기 시간 (초)
 STATUS_PERIOD = 0.5                     # 서버로 상태 전송 주기 (초)
@@ -39,6 +38,10 @@ stop_flag = False
 # 현재 위치/목표는 간단한 상태만 공유 (정확한 pose는 나중에)
 current_target_cell: Optional[Tuple[int, int]] = None
 last_auto_time = 0.0
+
+
+# 전역 WebSocket 클라이언트 인스턴스
+ws_client: Optional[AGVWebSocketClient] = None
 
 
 # ============ 서버 통신 (나중에 구현할 부분) ============
@@ -76,9 +79,11 @@ def send_status_to_server(status: dict):
         }
 
     TODO:
-        - requests.post(...) 혹은 WebSocket 등으로 전송
+        - WebSocket 등으로 전송
         - 지금은 print만 수행
     """
+
+
     print("[STATUS]", status)
 
 
